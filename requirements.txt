@@ -1,0 +1,22 @@
+# Flask requirements
+flask>=2.0
+
+# Google Generative AI
+google-generativeai>=0.4.0
+
+# Vector Database
+chromadb>=0.4.0
+
+# Data Handling & Generation
+pandas>=1.3
+Faker>=15.0
+
+# Environment Variables
+python-dotenv>=1.0.0
+
+# Visualization (Optional - for data_generation/initialize_kb.py)
+matplotlib>=3.5
+seaborn>=0.11
+
+# Add other dependencies as needed (e.g., gunicorn for deployment)
+
