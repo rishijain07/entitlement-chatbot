@@ -17,22 +17,23 @@ else:
 
 class Config:
     """Base configuration class."""
-    # Secret key for Flask sessions, etc. (change this!)
     SECRET_KEY = os.environ.get('SECRET_KEY') or 'you-will-never-guess'
 
-    # Database configuration
-    SQLITE_DB_FILE = os.environ.get('SQLITE_DB_FILE') or os.path.join(project_root, 'entitlements_inferred.db')
-    CHROMA_DB_PATH = os.environ.get('CHROMA_DB_PATH') or os.path.join(project_root, 'chroma_db_inferred')
-    CHROMA_COLLECTION_NAME = os.environ.get('CHROMA_COLLECTION_NAME') or 'entitlement_docs_inferred'
+    # --- Database configuration ---
+    # Point to the DB with Employee Holdings
+    SQLITE_DB_FILE = os.environ.get('SQLITE_DB_FILE') or os.path.join(project_root, 'entitlements_employee_db.db')
+    # Point to the corresponding Chroma DB
+    CHROMA_DB_PATH = os.environ.get('CHROMA_DB_PATH') or os.path.join(project_root, 'chroma_db_employee')
+    CHROMA_COLLECTION_NAME = os.environ.get('CHROMA_COLLECTION_NAME') or 'entitlement_docs_employee'
 
-    # RAG Model configuration
+    # --- RAG Model configuration ---
     EMBEDDING_MODEL = os.environ.get('EMBEDDING_MODEL') or 'models/embedding-001'
-    GENERATION_MODEL = os.environ.get('GENERATION_MODEL') or 'gemini-1.5-pro-latest' # Use latest
+    GENERATION_MODEL = os.environ.get('GENERATION_MODEL') or 'gemini-1.5-pro-latest'
     CHROMA_N_RESULTS = int(os.environ.get('CHROMA_N_RESULTS') or 3)
 
-    # API Keys
+    # --- API Keys ---
     GOOGLE_API_KEY = os.environ.get('GOOGLE_API_KEY')
 
-    # Add other configurations as needed
+    # --- Flask App Config ---
     DEBUG = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
 

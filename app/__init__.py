@@ -1,13 +1,13 @@
 # app/__init__.py
 # Main application package initialization
+# ** Updated to register both RAG and Lookup blueprints **
 
 import os
 from flask import Flask
 import google.generativeai as genai
 from dotenv import load_dotenv
 
-# Load environment variables from .env file (especially for API keys)
-# Make sure this runs before accessing environment variables in config
+# Load environment variables from .env file
 load_dotenv()
 
 # Import configuration after loading .env
@@ -31,18 +31,20 @@ def create_app(config_class=Config):
         except Exception as e:
             print(f"Error configuring Google Generative AI: {e}")
     else:
-        print("Warning: GOOGLE_API_KEY not set. RAG features requiring API calls will fail.")
+        print("Warning: GOOGLE_API_KEY not set. RAG/Embedding features will fail.")
 
-    # Initialize database connections/clients (or setup app context)
-    # For simplicity, utils functions will handle connections for now
+    # Initialize database utilities
     from . import utils
-    # You might add teardown contexts here if using app context for DBs
-    # app.teardown_appcontext(utils.close_db) # Example
+    utils.init_app(app) # Register teardown context etc.
+    print("Database utilities initialized.")
 
-    # Register routes/blueprints
-    from . import routes
-    app.register_blueprint(routes.bp)
-    print("Routes registered.")
+    # Register Blueprints
+    from . import routes # Contains rag_bp
+    from . import lookup_api # Contains lookup_bp
+
+    app.register_blueprint(routes.rag_bp) # Register RAG routes (/, /chat, /health)
+    app.register_blueprint(lookup_api.lookup_bp) # Register Lookup API routes (/api/entitlements)
+    print("Blueprints registered (RAG and Lookup API).")
 
     return app
 

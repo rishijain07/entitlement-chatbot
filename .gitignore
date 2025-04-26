@@ -137,7 +137,16 @@ cython_debug/
 *.vsprof
 
 # Project-specific ignores
+# Ignore log files
+*.log
+# Ignore SQLite database files (using the latest naming convention)
+/entitlements_employee_db.db*
+# Ignore ChromaDB persistent storage directory (using the latest naming convention)
+/chroma_db_employee/
+# Ignore previous versions if they exist
 /entitlements_inferred.db*
 /chroma_db_inferred/
-*.log
+/entitlements_jira_sim.db*
+/chroma_db_jira_sim/
+
 

@@ -1,5 +1,5 @@
 # data_generation/generate_mock_data.py
-# Contains logic for generating mock data using the inferential analysis method.
+# Updated to generate detailed employee holdings data.
 
 import random
 import re
@@ -8,11 +8,11 @@ from collections import defaultdict
 import pandas as pd
 import math
 
-# Initialize Faker
+# Initialize Faker globally for helpers
 fake = Faker()
 
 # --- Helper Functions ---
-# (Reused from Colab script)
+# (Same helper functions: generate_unique, get_role_level, get_entitlement_description)
 def generate_unique(generator_func, existing_set, max_attempts=100):
     for _ in range(max_attempts):
         value = generator_func()
@@ -45,38 +45,29 @@ def get_entitlement_description(action, app_name):
     default_desc = f"perform '{action_lower}' operations related to the {app_name}"
     return f"Grants permission to {verb_map.get(action, default_desc)}."
 
-# --- Main Generation Function ---
-def generate_all_data(num_employees=1000, num_roles=30, num_projects=60, num_apps=60, avg_ents_per_app=7, avg_proj_per_emp=1.5, freq_threshold=0.70):
-    """
-    Generates all mock data including inferred RoleProjectMappings.
 
-    Args:
-        num_employees (int): Number of employees to simulate.
-        num_roles (int): Number of distinct roles to generate.
-        num_projects (int): Number of projects to generate.
-        num_apps (int): Number of applications to generate.
-        avg_ents_per_app (int): Average entitlements per application.
-        avg_proj_per_emp (float): Average projects per employee.
-        freq_threshold (float): Frequency threshold for inferring mappings.
+# --- Main Generation Function ---
+def generate_data_with_holdings(
+    num_employees=1000, num_roles=30, num_projects=60, num_apps=60,
+    avg_ents_per_app=7, avg_proj_per_emp=1.5):
+    """
+    Generates base data (Projects, Roles, Apps, Entitlements) and detailed
+    Employee data including their assigned projects and specific entitlement holdings.
 
     Returns:
-        dict: A dictionary containing all generated data lists:
-              {'PROJECTS': [], 'ROLES': [], 'APPLICATIONS': [], 'ENTITLEMENTS': [],
-               'APP_ENTITLEMENT_MAPPINGS': [], 'ROLE_PROJECT_MAPPINGS': [],
-               'employees': [], 'employee_holdings': [], # Raw simulated data
-               'analysis_df': pd.DataFrame, 'inferred_mappings_df': pd.DataFrame} # Analysis results
+        dict: A dictionary containing all generated data lists.
     """
-    print("--- Starting Data Generation ---")
-
+    print("--- Starting Data Generation with Employee Holdings ---")
+    # (Same generation logic as in colab_generate_employee_holdings_py)
+    # ... (Full function logic pasted here for completeness) ...
     # Data Storage Lists
     PROJECTS, ROLES, APPLICATIONS, ENTITLEMENTS = [], [], [], []
-    APP_ENTITLEMENT_MAPPINGS, ROLE_PROJECT_MAPPINGS = [], []
-    employees, employee_holdings = [], []
-    analysis_df, inferred_mappings_df = pd.DataFrame(), pd.DataFrame() # For analysis results
-
-    # Part 1: Generate Base Data
+    APP_ENTITLEMENT_MAPPINGS = []
+    EMPLOYEES = []
+    EMPLOYEE_PROJECT_ASSIGNMENTS = []
+    EMPLOYEE_ENTITLEMENT_HOLDINGS = []
+    # --- Part 1: Generate Base Data ---
     print("--- Part 1: Generating Base Data ---")
-    # Generate Roles
     role_names = set()
     common_roles = [ # Expanded list
         'Junior Software Developer', 'Software Developer', 'Senior Software Developer', 'Lead Software Developer', 'Principal Software Engineer',
@@ -98,15 +89,11 @@ def generate_all_data(num_employees=1000, num_roles=30, num_projects=60, num_app
         if len(ROLES) >= num_roles : break
     role_ids = [r['id'] for r in ROLES]
     role_level_map = {r['id']: r['level'] for r in ROLES}
-
-    # Generate Projects
     project_names = set()
     for i in range(num_projects):
         project_name = generate_unique(fake.bs, project_names)
         PROJECTS.append({'id': i + 1, 'name': project_name.title(), 'description': fake.catch_phrase()})
     project_ids = [p['id'] for p in PROJECTS]
-
-    # Generate Applications and Entitlements
     BANK_APPS = [ # Base list
         {'name': 'Branch Customer Portal', 'description': 'Web portal for branch staff.'}, {'name': 'Core Banking System (CBS)', 'description': 'Main system for accounts.'},
         {'name': 'Home Loan Origination', 'description': 'Home loan application process.'}, {'name': 'Auto Loan Processing', 'description': 'Auto loan application process.'},
@@ -129,7 +116,7 @@ def generate_all_data(num_employees=1000, num_roles=30, num_projects=60, num_app
         app_name = app_data['name']; app_description = app_data['description']
         app_code = f"APP{app_id_counter:03d}"; app_id = app_id_counter; app_id_counter += 1
         APPLICATIONS.append({'id': app_id, 'name': app_name, 'description': app_description})
-        num_entitlements = random.randint(max(1, avg_ents_per_app - 1), avg_ents_per_app + 2) # Range 6-9 if avg=7
+        num_entitlements = random.randint(max(1, avg_ents_per_app - 1), avg_ents_per_app + 2)
         possible_actions = ['READ', 'WRITE', 'EXECUTE', 'ADMIN', 'VIEW', 'CREATE', 'DELETE', 'APPROVE', 'CONFIG', 'AUDIT', 'MANAGE', 'REPORT', 'SEARCH']
         actions = random.sample(possible_actions, min(num_entitlements, len(possible_actions)))
         for action in actions:
@@ -141,19 +128,23 @@ def generate_all_data(num_employees=1000, num_roles=30, num_projects=60, num_app
                 entitlements_by_app[app_id].append(entitlement_id)
     all_entitlement_ids = [e['id'] for e in ENTITLEMENTS]
     print(f"Generated {len(PROJECTS)}P, {len(ROLES)}R, {len(APPLICATIONS)}A, {len(ENTITLEMENTS)}E")
-
-    # Part 2: Simulate Employee Data and Current Holdings
-    print("--- Part 2: Simulating Employee Data and Current Holdings ---")
+    # --- Part 2: Generate Employees and Assign Holdings ---
+    print("--- Part 2: Generating Employees and Assigning Holdings ---")
     core_entitlement_ids = random.sample(all_entitlement_ids, k=min(5, len(all_entitlement_ids))) if all_entitlement_ids else []
     for i in range(num_employees):
-        emp_id = 1000 + i; assigned_project_ids = []
+        emp_id = 1000 + i
         if not role_ids: continue
         assigned_role_id = random.choice(role_ids)
-        if project_ids: num_projects = max(1, int(random.gauss(avg_proj_per_emp, 0.5))); assigned_project_ids = random.sample(project_ids, min(num_projects, len(project_ids)))
-        employees.append({'id': emp_id, 'role_id': assigned_role_id, 'project_ids': assigned_project_ids})
+        emp_name = fake.name(); emp_email = f"{emp_name.lower().replace(' ', '.').replace(',','').replace('-','')}{random.randint(1,999)}@example.bank"
+        EMPLOYEES.append({'id': emp_id, 'name': emp_name, 'email': emp_email, 'role_id': assigned_role_id})
+        if(emp_id % 500 == 0): print(f"Generated {emp_id} - {emp_name} ({emp_email})")
+        assigned_project_ids = []
+        if project_ids:
+            num_projects = max(1, int(random.gauss(avg_proj_per_emp, 0.5)))
+            assigned_project_ids = random.sample(project_ids, min(num_projects, len(project_ids)))
+            for proj_id in assigned_project_ids: EMPLOYEE_PROJECT_ASSIGNMENTS.append({'employee_id': emp_id, 'project_id': proj_id})
         role_level = role_level_map.get(assigned_role_id, 2); current_emp_entitlements = set()
         if not all_entitlement_ids: continue
-        # Assign Core, Role/Level Specific, Project Random, Noise (same logic as before)
         for core_id in core_entitlement_ids:
             if random.random() < 0.95: current_emp_entitlements.add(core_id)
         num_role_specific = 0
@@ -163,71 +154,26 @@ def generate_all_data(num_employees=1000, num_roles=30, num_projects=60, num_app
         potential_role_entitlements = []
         for ent in ENTITLEMENTS:
             code = ent['code']
-            if role_level == 5 and '_APPROVE' in code: potential_role_entitlements.append(ent['id'])
-            elif role_level == 4 and '_ADMIN' in code: potential_role_entitlements.append(ent['id'])
-            elif role_level <= 3 and ('_WRITE' in code or '_EXECUTE' in code or '_CREATE' in code): potential_role_entitlements.append(ent['id'])
+            if role_level == 5 and ('_APPROVE' in code or '_ADMIN' in code): potential_role_entitlements.append(ent['id'])
+            elif role_level == 4 and ('_ADMIN' in code or '_CONFIG' in code): potential_role_entitlements.append(ent['id'])
+            elif role_level <= 3 and ('_WRITE' in code or '_EXECUTE' in code or '_CREATE' in code or '_DELETE' in code): potential_role_entitlements.append(ent['id'])
             elif '_READ' in code or '_VIEW' in code: potential_role_entitlements.append(ent['id'])
         if potential_role_entitlements: current_emp_entitlements.update(random.sample(potential_role_entitlements, min(num_role_specific, len(potential_role_entitlements))))
         num_project_specific = random.randint(3, 10); current_emp_entitlements.update(random.sample(all_entitlement_ids, min(num_project_specific, len(all_entitlement_ids))))
         if random.random() < 0.1 and current_emp_entitlements: current_emp_entitlements.discard(random.choice(list(current_emp_entitlements)))
         if random.random() < 0.15: current_emp_entitlements.add(random.choice(all_entitlement_ids))
-        # Store holdings
-        for proj_id in assigned_project_ids:
-            for ent_id in current_emp_entitlements:
-                employee_holdings.append({'employee_id': emp_id, 'role_id': assigned_role_id, 'project_id': proj_id, 'entitlement_id': ent_id})
-    print(f"Simulated {len(employees)} employees and {len(employee_holdings)} total assignments.")
-
-    # Part 3: Frequency Analysis
-    print("--- Part 3: Performing Frequency Analysis ---")
-    if employee_holdings:
-        holdings_df = pd.DataFrame(employee_holdings)
-        profile_counts = holdings_df.groupby(['project_id', 'role_id'])['employee_id'].nunique().reset_index()
-        profile_counts.rename(columns={'employee_id': 'total_employees_in_profile'}, inplace=True)
-        entitlement_counts_in_profile = holdings_df.groupby(['project_id', 'role_id', 'entitlement_id'])['employee_id'].nunique().reset_index()
-        entitlement_counts_in_profile.rename(columns={'employee_id': 'employees_with_entitlement'}, inplace=True)
-        analysis_df = pd.merge(entitlement_counts_in_profile, profile_counts, on=['project_id', 'role_id'], how='left')
-        analysis_df['frequency'] = analysis_df.apply(lambda row: row['employees_with_entitlement'] / row['total_employees_in_profile'] if row['total_employees_in_profile'] > 0 else 0, axis=1)
-        inferred_mappings_df = analysis_df[analysis_df['frequency'] >= freq_threshold].copy()
-        print(f"Inferred {len(inferred_mappings_df)} potential mappings (frequency >= {freq_threshold}).")
-    else:
-        print("No holdings simulated, skipping analysis.")
-
-    # Part 4: Generate Final ROLE_PROJECT_MAPPINGS
-    print("--- Part 4: Generating Final ROLE_PROJECT_MAPPINGS ---")
-    if not inferred_mappings_df.empty:
-        final_mappings_df = inferred_mappings_df[['role_id', 'project_id', 'entitlement_id']]
-        ROLE_PROJECT_MAPPINGS = final_mappings_df.to_dict(orient='records')
-    else: ROLE_PROJECT_MAPPINGS = []
-    print(f"Created final ROLE_PROJECT_MAPPINGS list with {len(ROLE_PROJECT_MAPPINGS)} entries.")
-    print("*** IMPORTANT: Mappings INFERRED from simulation, require SME validation in real-world.")
-
+        for ent_id in current_emp_entitlements: EMPLOYEE_ENTITLEMENT_HOLDINGS.append({'employee_id': emp_id, 'entitlement_id': ent_id})
+    print(f"Generated {len(EMPLOYEES)} employees, {len(EMPLOYEE_PROJECT_ASSIGNMENTS)} assignments, {len(EMPLOYEE_ENTITLEMENT_HOLDINGS)} holdings.")
     print("--- Data Generation Complete ---")
+    return {'PROJECTS': PROJECTS, 'ROLES': ROLES, 'APPLICATIONS': APPLICATIONS, 'ENTITLEMENTS': ENTITLEMENTS,
+            'APP_ENTITLEMENT_MAPPINGS': APP_ENTITLEMENT_MAPPINGS, 'EMPLOYEES': EMPLOYEES,
+            'EMPLOYEE_PROJECT_ASSIGNMENTS': EMPLOYEE_PROJECT_ASSIGNMENTS, 'EMPLOYEE_ENTITLEMENT_HOLDINGS': EMPLOYEE_ENTITLEMENT_HOLDINGS}
 
-    # Return all generated data
-    return {
-        'PROJECTS': PROJECTS,
-        'ROLES': ROLES,
-        'APPLICATIONS': APPLICATIONS,
-        'ENTITLEMENTS': ENTITLEMENTS,
-        'APP_ENTITLEMENT_MAPPINGS': APP_ENTITLEMENT_MAPPINGS,
-        'ROLE_PROJECT_MAPPINGS': ROLE_PROJECT_MAPPINGS,
-        'employees': employees, # Include raw simulated data if needed elsewhere
-        'employee_holdings': employee_holdings,
-        'analysis_df': analysis_df, # Include analysis results if needed
-        'inferred_mappings_df': inferred_mappings_df
-    }
-
-# Example of how to run this (usually called from initialize_kb.py)
+# Example usage (if run directly)
 if __name__ == '__main__':
-    print("Running data generation standalone as an example...")
-    generated_data = generate_all_data()
+    print("Running data generation standalone...")
+    generated_data = generate_data_with_holdings(num_employees=50) # Smaller for test
     print("\n--- Standalone Run Summary ---")
-    print(f"Generated Projects: {len(generated_data['PROJECTS'])}")
-    print(f"Generated Roles: {len(generated_data['ROLES'])}")
-    print(f"Generated Applications: {len(generated_data['APPLICATIONS'])}")
-    print(f"Generated Entitlements: {len(generated_data['ENTITLEMENTS'])}")
-    print(f"Generated App Mappings: {len(generated_data['APP_ENTITLEMENT_MAPPINGS'])}")
-    print(f"Generated/Inferred Role-Project Mappings: {len(generated_data['ROLE_PROJECT_MAPPINGS'])}")
-    print(f"Simulated Employees: {len(generated_data['employees'])}")
-    # print("\nSample Inferred Mapping:", random.choice(generated_data['ROLE_PROJECT_MAPPINGS']) if generated_data['ROLE_PROJECT_MAPPINGS'] else "N/A")
+    print(f"Generated Employees: {len(generated_data['EMPLOYEES'])}")
+    print(f"Generated Holdings: {len(generated_data['EMPLOYEE_ENTITLEMENT_HOLDINGS'])}")
 
