@@ -152,7 +152,7 @@ def generate_llm_response(query, context):
     generation_model = current_app.config.get('GENERATION_MODEL')
     if not api_key: print("      Skipping LLM generation: API key missing."); return "Sorry, I cannot generate a response without API key configuration."
     if not generation_model: print("      Skipping LLM generation: Generation model not configured."); return "Sorry, I cannot generate a response due to configuration issue."
-    prompt = f"""You are an Entitlement Assistant chatbot. Answer the user's query based *only* on the provided context below. Do not add information not present in the context. If the context doesn't contain the answer, say you don't have enough information.
+    prompt = f"""You are an Entitlement Assistant chatbot. Answer the user's query based *only* on the provided context below. Do not add information not present in the context. If the context doesn't contain the answer, say you don't have enough information. And you can reply to greeting messages and thank you messages with a friendly response. If the user asks for a list of entitlements, provide a list of entitlement codes and descriptions based on the context.
 
 Context:
 ---
