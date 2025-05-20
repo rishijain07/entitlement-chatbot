@@ -1,180 +1,267 @@
 # app/rag_pipeline.py
-# Core RAG pipeline logic.
-# ** Updated retrieve_structured_data to use employee holdings DB schema **
+# Core RAG pipeline logic using Langchain for SQL generation and conversational memory.
 
 import re
 import sqlite3
 import google.generativeai as genai
-from flask import current_app
+from flask import current_app, g # For app context and config
+import traceback # For more detailed error logging
 
-# --- RAG Pipeline Helper Functions ---
+# Langchain imports
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.chains import create_sql_query_chain # To generate SQL
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain.memory import ConversationBufferMemory
+# from langchain.agents import AgentExecutor, create_tool_calling_agent # For a more general agent
+# from langchain_community.agent_toolkits import SQLDatabaseToolkit # For SQL agent
+# from langchain.tools import Tool # For custom tools if needed
 
-def parse_query(query, conn):
-    """Basic keyword parsing to identify entities."""
-    # (Same parse_query function as before)
-    print(f"   Parsing query: '{query}'")
-    parsed = {'role': None, 'project': None, 'app': None, 'ent_code': None}
-    if not conn: return parsed
-    cursor = conn.cursor()
-    try:
-        ent_match = re.search(r'\b(APP\d{3,}_\w+)\b', query, re.IGNORECASE)
-        if ent_match:
-            parsed['ent_code'] = ent_match.group(1).upper()
-            cursor.execute("SELECT id FROM Entitlements WHERE code = ?", (parsed['ent_code'],))
-            if not cursor.fetchone(): parsed['ent_code'] = None
-            else: print(f"      Found potential entitlement code: {parsed['ent_code']}")
-        cursor.execute("SELECT id, name FROM Roles")
-        roles_db = cursor.fetchall()
-        for r in roles_db:
-            if re.search(r'\b' + re.escape(r['name']) + r'\b', query, re.IGNORECASE):
-                parsed['role'] = {'id': r['id'], 'name': r['name']}; print(f"      Found potential role: {parsed['role']}"); break
-        cursor.execute("SELECT id, name FROM Projects")
-        projects_db = cursor.fetchall()
-        for p in projects_db:
-            if re.search(r'\b' + re.escape(p['name']) + r'\b', query, re.IGNORECASE):
-                parsed['project'] = {'id': p['id'], 'name': p['name']}; print(f"      Found potential project: {parsed['project']}"); break
-        cursor.execute("SELECT id, name FROM Applications")
-        apps_db = cursor.fetchall()
-        for a in apps_db:
-            if re.search(r'\b' + re.escape(a['name']) + r'\b', query, re.IGNORECASE):
-                parsed['app'] = {'id': a['id'], 'name': a['name']}; print(f"      Found potential application: {parsed['app']}"); break
-    except sqlite3.Error as e: print(f"      DB Error during parsing: {e}")
-    except Exception as e: print(f"      Unexpected error during parsing: {e}")
-    return parsed
+# Import utils for DB access
+from . import utils
+
+# --- Global or App-Context based LLM and Memory (Example) ---
+global_memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
 
-def retrieve_structured_data(parsed_entities, conn):
+def get_llm():
+    """Initializes and returns the LLM instance."""
+    if 'llm' not in g:
+        model_name = current_app.config.get('GENERATION_MODEL_NAME', 'gemini-1.5-pro-latest')
+        try:
+            g.llm = ChatGoogleGenerativeAI(model=model_name, temperature=0.2, convert_system_message_to_human=True) # Lower temp for factual tasks
+            print(f"LLM initialized with model: {model_name}")
+        except Exception as e:
+            print(f"Error initializing LLM: {e}")
+            g.llm = None
+    return g.llm
+
+def get_session_memory():
     """
-    Retrieves data from SQLite based on parsed entities.
-    Queries employee holdings for Role/Project lookups.
+    Placeholder for session-specific memory.
+    Currently returns a global memory instance.
     """
-    print("   Retrieving structured data from SQLite...")
-    context_lines = []
-    if not conn: print("      SQLite connection not available."); return context_lines
-    cursor = conn.cursor()
+    return global_memory
+
+
+# --- Langchain SQL Query Chain ---
+def create_db_query_chain(llm, db, k_for_prompt: int): # MODIFIED: Added k_for_prompt
+    """Creates a Langchain chain to generate and execute SQL queries."""
+    if not db:
+        print("Database not available for SQL query chain.")
+        return None
     try:
-        # Case 1: Role and Project specified -> Find common entitlements held by matching employees
-        if parsed_entities.get('role') and parsed_entities.get('project'):
-            role_id = parsed_entities['role']['id']
-            project_id = parsed_entities['project']['id']
-            role_name = parsed_entities['role']['name']
-            project_name = parsed_entities['project']['name']
-            print(f"      Querying actual holdings for Role '{role_name}' (ID: {role_id}) on Project '{project_name}' (ID: {project_id})...")
-            query_employees = """
-                SELECT DISTINCT Emp.id
-                FROM Employees Emp
-                JOIN EmployeeProjectAssignments EPA ON Emp.id = EPA.employee_id
-                WHERE Emp.role_id = ? AND EPA.project_id = ?
-            """
-            cursor.execute(query_employees, (role_id, project_id))
-            matching_employees = cursor.fetchall()
-            employee_ids = [row['id'] for row in matching_employees]
+        sql_prompt_text = """Based on the table schema below, write a SQL query that would answer the user's question ({input}).
+You are requested to limit the number of results to {top_k} if you are selecting many rows or if the question implies a list.
+Only ask for the specific columns needed to answer the question. Do not select all columns unless explicitly asked.
+Pay attention to the user's question to extract entities like role names, project names, or application names.
+Only use the tables listed below. Do not hallucinate table or column names.
+Return ONLY the raw SQL query with no formatting, no markdown, no code blocks, and no extra text.
 
-            if employee_ids:
-                print(f"        Found {len(employee_ids)} employees matching role/project.")
-                placeholders = ','.join('?' * len(employee_ids))
-                query_entitlements = f"""
-                    SELECT EH.entitlement_id, E.code, E.description, COUNT(DISTINCT EH.employee_id) as holder_count
-                    FROM EmployeeEntitlementHoldings EH
-                    JOIN Entitlements E ON EH.entitlement_id = E.id
-                    WHERE EH.employee_id IN ({placeholders})
-                    GROUP BY EH.entitlement_id, E.code, E.description
-                    ORDER BY holder_count DESC
-                """
-                cursor.execute(query_entitlements, employee_ids)
-                entitlement_holdings = cursor.fetchall()
-                if entitlement_holdings:
-                    context_lines.append(f"Common Entitlements held by {role_name} on {project_name} (based on {len(employee_ids)} matching employees):")
-                    for row in entitlement_holdings[:15]: # Limit context
-                        context_lines.append(f"- {row['code']} (Held by {row['holder_count']}/{len(employee_ids)}): {row['description']}")
-                    if len(entitlement_holdings) > 15: context_lines.append("  (Additional entitlements held exist...)")
-                else: context_lines.append(f"No specific entitlement holdings found for the {len(employee_ids)} employees matching {role_name} on {project_name}.")
-            else: context_lines.append(f"No employees found with role '{role_name}' assigned to project '{project_name}'.")
+Schema:
+{table_info}
 
-        # Case 2: Application specified (Same as before)
-        elif parsed_entities.get('app'):
-            app_id = parsed_entities['app']['id']; app_name = parsed_entities['app']['name']
-            print(f"      Querying entitlements for Application '{app_name}'...")
-            query = "SELECT E.code, E.description FROM AppEntitlementMappings AEM JOIN Entitlements E ON AEM.entitlement_id = E.id WHERE AEM.app_id = ?"
-            cursor.execute(query, (app_id,))
-            results = cursor.fetchall()
-            if results:
-                context_lines.append(f"Entitlements associated with Application '{app_name}':")
-                for row in results: context_lines.append(f"- {row['code']}: {row['description']}")
-            else: context_lines.append(f"No entitlements found mapped to Application '{app_name}'.")
+SQL Query:"""
+        
+        prompt = PromptTemplate(
+            input_variables=["input", "table_info", "top_k"], 
+            template=sql_prompt_text
+        )
+        
+        # MODIFIED: Pass k_for_prompt as the 'k' argument to create_sql_query_chain
+        # This 'k' argument will populate the {top_k} variable in your custom prompt.
+        generate_query_chain = create_sql_query_chain(llm, db, prompt=prompt, k=k_for_prompt)
+        return generate_query_chain
+    except Exception as e:
+        print(f"Error creating SQL query chain: {e}")
+        traceback.print_exc() # Print full traceback for debugging
+        return None
 
-        # Case 3: Entitlement Code specified (Same as before)
-        elif parsed_entities.get('ent_code'):
-            ent_code = parsed_entities['ent_code']
-            print(f"      Querying description for Entitlement Code '{ent_code}'...")
-            cursor.execute("SELECT description FROM Entitlements WHERE code = ?", (ent_code,))
-            result = cursor.fetchone()
-            if result: context_lines.append(f"Description for {ent_code}: {result['description']}")
-            else: context_lines.append(f"Could not find description for entitlement code '{ent_code}'.")
+def clean_sql_query(query):
+    """
+    Clean SQL query by removing markdown code block syntax and any surrounding whitespace.
+    """
+    # Remove markdown code block syntax if present
+    query = re.sub(r'^```\s*sql\s*', '', query)
+    query = re.sub(r'```$', '', query)
+    # Clean any leading/trailing whitespace
+    query = query.strip()
+    return query
 
-    except sqlite3.Error as e: print(f"      SQLite query error: {e}")
-    except Exception as e: print(f"      Unexpected error during structured retrieval: {e}")
-    if not context_lines: print("      No specific structured data found.")
-    return context_lines
+def execute_sql_query(query, db):
+    """Executes a SQL query using the Langchain SQLDatabase tool and returns the result."""
+    # Clean the query before execution
+    cleaned_query = clean_sql_query(query)
+    print(f"   Original SQL: {query}")
+    print(f"   Cleaned SQL: {cleaned_query}")
+    
+    if not db:
+        return "Error: Database connection not available for SQL execution."
+    try:
+        result = db.run(cleaned_query) 
+        print(f"   SQL Result (first 100 chars): {str(result)[:100]}...")
+        return result
+    except Exception as e:
+        print(f"   Error executing SQL query '{cleaned_query}': {e}")
+        traceback.print_exc() # Print full traceback for debugging
+        return f"Error executing SQL: {e}"
 
+
+# --- Vector Retrieval (ChromaDB) ---
 def retrieve_vector_data(query, collection):
     """Retrieves relevant documents from ChromaDB based on query similarity."""
-    # (Same retrieve_vector_data function as before)
     print("   Retrieving relevant documents from ChromaDB...")
     context_lines = []
     api_key = current_app.config.get('GOOGLE_API_KEY')
-    embedding_model = current_app.config.get('EMBEDDING_MODEL')
-    n_results = current_app.config.get('CHROMA_N_RESULTS', 3)
+    embedding_model_name = current_app.config.get('EMBEDDING_MODEL_NAME')
+    # Use CHROMA_QUERY_N_RESULTS for querying, CHROMA_N_RESULTS might be for init or other uses
+    n_results = current_app.config.get('CHROMA_QUERY_N_RESULTS', 5) 
+
     if not api_key: print("      Skipping ChromaDB retrieval: API key missing."); return context_lines
     if not collection: print("      Skipping ChromaDB retrieval: Collection not available."); return context_lines
-    if not embedding_model: print("      Skipping ChromaDB retrieval: Embedding model not configured."); return context_lines
+    if not embedding_model_name: print("      Skipping ChromaDB retrieval: Embedding model not configured."); return context_lines
+
     try:
-        print(f"      Embedding query for ChromaDB using '{embedding_model}'...")
-        query_embedding_result = genai.embed_content(model=embedding_model, content=query, task_type="RETRIEVAL_QUERY")
+        print(f"      Embedding query for ChromaDB using '{embedding_model_name}'...")
+        query_embedding_result = genai.embed_content(model=embedding_model_name, content=query, task_type="RETRIEVAL_QUERY")
         query_embedding = query_embedding_result['embedding']
-        print("      Query embedded. Searching collection...")
+        print(f"      Query embedded. Searching collection for {n_results} results...")
         results = collection.query(query_embeddings=[query_embedding], n_results=n_results, include=['documents', 'metadatas'])
+        
         if results and results.get('ids') and results['ids'][0]:
             print(f"      Found {len(results['ids'][0])} potentially relevant documents.")
-            context_lines.append("Potentially Relevant Entitlement Descriptions:")
+            context_lines.append("Potentially Relevant Entitlement Descriptions from Vector Search:")
             for i in range(len(results['ids'][0])):
                 meta = results['metadatas'][0][i]; doc = results['documents'][0][i]
-                context_lines.append(f"- {meta.get('code', 'Unknown Code')}: {doc}")
+                context_lines.append(f"- Code {meta.get('code', 'N/A')} (ID: {meta.get('id', 'N/A')}): {doc}")
         else: print("      No relevant documents found in ChromaDB.")
-    except Exception as e: print(f"      Error during ChromaDB retrieval/embedding: {e}")
+    except Exception as e: 
+        print(f"      Error during ChromaDB retrieval/embedding: {e}")
+        traceback.print_exc()
     return context_lines
 
-def generate_llm_response(query, context):
-    """Generates response using Gemini based on query and context."""
-    # (Same generate_llm_response function as before)
-    print("   Generating response using Gemini...")
-    api_key = current_app.config.get('GOOGLE_API_KEY')
-    generation_model = current_app.config.get('GENERATION_MODEL')
-    if not api_key: print("      Skipping LLM generation: API key missing."); return "Sorry, I cannot generate a response without API key configuration."
-    if not generation_model: print("      Skipping LLM generation: Generation model not configured."); return "Sorry, I cannot generate a response due to configuration issue."
-    prompt = f"""You are an Entitlement Assistant chatbot. Answer the user's query based *only* on the provided context below. Do not add information not present in the context. If the context doesn't contain the answer, say you don't have enough information. And you can reply to greeting messages and thank you messages with a friendly response. If the user asks for a list of entitlements, provide a list of entitlement codes and descriptions based on the context.
+# --- Main RAG Chain with Conversational Memory ---
+def get_conversational_rag_answer(user_query, db_connection_for_sql_tool, chroma_collection_for_vector):
+    """
+    Processes the user query using a RAG pipeline with conversational memory
+    and LLM-powered SQL generation.
+    """
+    print("--- Executing Conversational RAG Pipeline ---")
+    llm = get_llm()
+    if not llm:
+        return "Error: LLM not available."
 
-Context:
----
-{context}
----
+    langchain_db = db_connection_for_sql_tool 
 
-User Query: {query}
+    sql_query_result = "No SQL query was executed or needed for this query." # Default message
+    generated_sql = "N/A"
+    
+    if langchain_db:
+        # MODIFIED: Get top_k_val for the k_for_prompt argument
+        top_k_val = current_app.config.get('LANGCHAIN_SQL_TOP_K', 5) 
+        db_query_chain = create_db_query_chain(llm, langchain_db, k_for_prompt=top_k_val)
+        
+        if db_query_chain:
+            try:
+                print("   Attempting to generate SQL query...")
+                # MODIFIED: Invoke with "question" key
+                generated_sql = db_query_chain.invoke({"question": user_query})
+                
+                # Improved check for valid SQL or LLM's decision not to query
+                if "error" in generated_sql.lower() or \
+                   not generated_sql.strip() or \
+                   "select" not in generated_sql.lower() or \
+                   len(generated_sql.strip()) < 10 or \
+                   "i don't need to query" in generated_sql.lower() or \
+                   "no sql query is needed" in generated_sql.lower():
+                    
+                    print(f"   LLM indicated an issue generating SQL or SQL not needed: {generated_sql}")
+                    if "i don't need to query" in generated_sql.lower() or \
+                       "no sql query is needed" in generated_sql.lower() or \
+                       ("select" not in generated_sql.lower() and len(generated_sql.strip()) > 5) : # If it's a short non-SQL phrase
+                        sql_query_result = "The Language Model determined that a SQL query was not necessary for this question."
+                        generated_sql = "N/A (LLM decided SQL not required)"
+                    else:
+                        sql_query_result = f"Could not generate a suitable SQL query. LLM Output: {generated_sql}"
+                        generated_sql = f"N/A (LLM failed to generate valid SQL: {generated_sql})"
+                else:
+                    # Store the original generated SQL before cleaning for display purposes
+                    original_sql = generated_sql
+                    sql_query_result = execute_sql_query(generated_sql, langchain_db)
+                    # Keep the original SQL for display in final context
+                    generated_sql = original_sql
+            except KeyError as ke: # Specifically catch KeyError
+                print(f"   KeyError during SQL generation/execution: {ke}")
+                print("     This might indicate an issue with expected keys in Langchain's create_sql_query_chain or its inputs.")
+                traceback.print_exc()
+                sql_query_result = f"Error during SQL processing (KeyError: {ke}). Please check prompt and chain input configurations."
+                generated_sql = "Error during generation (KeyError)"
+            except Exception as e:
+                print(f"   Error in SQL generation/execution part of the chain: {e}")
+                traceback.print_exc()
+                sql_query_result = f"Error during SQL processing: {e}"
+                generated_sql = "Error during generation"
+        else:
+            sql_query_result = "SQL query chain could not be created (returned None)."
+    else:
+        sql_query_result = "Database for SQL queries is not configured or available."
 
-Answer:"""
-    print(f"      Sending prompt (length: {len(prompt)}) to model '{generation_model}'...")
+
+    vector_context_lines = retrieve_vector_data(user_query, chroma_collection_for_vector)
+    vector_context_str = "\n".join(vector_context_lines) if vector_context_lines else "No additional relevant information found via semantic search of entitlement descriptions."
+
+    memory = get_session_memory()
+    # Ensure chat_history is correctly loaded; it might be empty on first turn
+    chat_history_messages = memory.load_memory_variables({}).get("chat_history", [])
+
+
+    final_context = f"""
+    User Query: {user_query}
+
+    Information from Database (via SQL query, if attempted):
+    Generated SQL: {generated_sql}
+    SQL Query Result:
+    {sql_query_result}
+
+    Additional Information from Semantic Search (Vector DB of entitlement descriptions):
+    {vector_context_str}
+    """
+
+    # Refined system prompt for better instruction
+    system_prompt_text = (
+        "You are a specialized Entitlement Assistant. Your primary goal is to answer the user's questions about application entitlements "
+        "based *solely* on the information provided in the 'Context' section below. The context includes results from database queries and semantic searches. "
+        "Carefully review all parts of the context. "
+        "If the 'SQL Query Result' indicates an error, no data, or that a query wasn't needed, state that clearly. "
+        "If 'Additional Information from Semantic Search' is empty or states no relevant documents were found, acknowledge that. "
+        "Synthesize a comprehensive answer from all available pieces of information. "
+        "If the combined context is insufficient to fully answer the question, clearly state what information is missing or unclear. "
+        "Do not make up information or answer outside of the provided context. "
+        "If a specific entitlement code is identified (e.g., APP001_READ), mention it. "
+        "Maintain a helpful and professional tone."
+    )
+
+    final_answer_prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt_text),
+        MessagesPlaceholder(variable_name="chat_history"), # Ensure this is correctly populated
+        ("human", "Context:\n{context}\n\nUser's Question: {question}\n\nAssistant's Answer:"),
+    ])
+
+    final_chain = final_answer_prompt | llm | StrOutputParser()
+
+    print("   Generating final response with aggregated context and history...")
     try:
-        model = genai.GenerativeModel(generation_model)
-        response = model.generate_content(prompt)
-        if not response.parts:
-             if response.prompt_feedback.block_reason:
-                  details = f" Ratings: {response.prompt_feedback.safety_ratings}" if response.prompt_feedback.safety_ratings else ""
-                  print(f"      Warning: Response blocked due to {response.prompt_feedback.block_reason}{details}")
-                  return f"My response was blocked due to safety settings ({response.prompt_feedback.block_reason}). Please rephrase your query."
-             else: print("      Warning: LLM returned no content."); return "Sorry, I could not generate a response for that query."
-        response_text = getattr(response, 'text', None)
-        if response_text is None: print("      Warning: LLM response did not contain text."); return "Sorry, I received an unexpected response format."
-        print("      LLM response received.")
-        return response_text
-    except Exception as e: print(f"      Error during Gemini API call: {e}"); return "Sorry, an error occurred while generating the response."
+        response_text = final_chain.invoke({
+            "context": final_context,
+            "question": user_query,
+            "chat_history": chat_history_messages # Pass the actual messages
+        })
+    except Exception as e:
+        print(f"   Error during final LLM response generation: {e}")
+        traceback.print_exc()
+        response_text = "Sorry, an error occurred while formulating the final answer. Please check the server logs for more details."
 
+    memory.save_context({"input": user_query}, {"output": response_text})
+
+    return response_text

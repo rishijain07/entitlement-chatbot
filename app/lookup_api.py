@@ -24,7 +24,7 @@ def get_entitlements_by_email():
 
     print(f"Received request at /api/entitlements for email: {email}")
 
-    conn = utils.get_db() # Get DB connection from utils
+    conn = utils.get_db_connection() # Get DB connection from utils
     if not conn:
         return jsonify({"error": "Database connection failed"}), 503
 

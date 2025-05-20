@@ -1,14 +1,14 @@
 # app/routes.py
 # Defines the Flask routes/endpoints for the RAG application (frontend & chat API).
-# Renamed Blueprint to 'rag_bp'.
 
 import time
+import traceback # Added for better error logging
 from flask import Blueprint, request, jsonify, current_app, render_template
 from . import utils
 from . import rag_pipeline
 
 # Create Blueprint for RAG functionality
-rag_bp = Blueprint('rag', __name__) # Renamed from 'main'
+rag_bp = Blueprint('rag', __name__)
 
 # --- Route to serve the frontend ---
 @rag_bp.route('/', methods=['GET'])
@@ -20,40 +20,67 @@ def index():
 # --- API Endpoint for Chat ---
 @rag_bp.route('/chat', methods=['POST'])
 def chat_handler():
-    """Handles incoming chat queries and executes the RAG pipeline."""
-    # (Same chat_handler logic as before, using rag_pipeline functions)
-    # ... (omitted for brevity, assume function is pasted here) ...
+    """Handles incoming chat queries and executes the updated RAG pipeline."""
     start_time = time.time()
     print(f"\nReceived request at /chat")
-    if not request.is_json: return jsonify({"error": "Request must be JSON"}), 400
-    data = request.get_json(); user_query = data.get('query')
-    if not user_query: return jsonify({"error": "'query' field is required"}), 400
+
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON"}), 400
+
+    data = request.get_json()
+    user_query = data.get('query')
+
+    if not user_query:
+        return jsonify({"error": "'query' field is required"}), 400
+
     print(f"User Query: '{user_query}'")
     response_text = "Could not process the request."
-    conn = None; coll = None
+
     try:
-        conn = utils.get_db(); coll = utils.get_chroma_collection()
-        if conn is None: raise ConnectionError("Failed to connect to SQLite database.")
-        parsed_entities = rag_pipeline.parse_query(user_query, conn)
-        structured_context = rag_pipeline.retrieve_structured_data(parsed_entities, conn)
-        vector_context = rag_pipeline.retrieve_vector_data(user_query, coll)
-        print("   Aggregating context...")
-        context_parts = []
-        if structured_context: context_parts.append("Information from Database:"); context_parts.extend(structured_context)
-        if vector_context:
-             if context_parts: context_parts.append("\n")
-             context_parts.extend(vector_context)
-        if not context_parts: aggregated_context = "No specific information found in the knowledge base for your query."; print("      No context retrieved.")
-        else: aggregated_context = "\n".join(context_parts); print(f"      Aggregated context length: {len(aggregated_context)}")
-        response_text = rag_pipeline.generate_llm_response(user_query, aggregated_context)
+        # Get necessary components for the RAG pipeline
+        # The rag_pipeline.get_conversational_rag_answer function expects:
+        # 1. user_query
+        # 2. db_connection_for_sql_tool (which is the Langchain SQLDatabase object)
+        # 3. chroma_collection_for_vector
+        
+        langchain_sql_db = utils.get_langchain_sql_db()
+        chroma_collection = utils.get_chroma_collection()
+
+        if langchain_sql_db is None:
+            print("! Connection Error: Langchain SQLDatabase utility could not be initialized.")
+            raise ConnectionError("Failed to initialize Langchain SQL Database utility.")
+        
+        if chroma_collection is None:
+            print("! Connection Error: ChromaDB collection could not be retrieved.")
+            raise ConnectionError("Failed to retrieve ChromaDB collection.")
+
+        print("   Successfully retrieved Langchain SQL DB utility and ChromaDB collection.")
+        
+        # Execute the conversational RAG pipeline
+        response_text = rag_pipeline.get_conversational_rag_answer(
+            user_query=user_query,
+            db_connection_for_sql_tool=langchain_sql_db, # This is the Langchain SQLDatabase object
+            chroma_collection_for_vector=chroma_collection
+        )
+
     except ConnectionError as e:
-         print(f"! Connection Error: {e}"); response_text = "Error connecting to backend data stores."
-         return jsonify({"error": response_text}), 503 # Service Unavailable
+        print(f"! Connection Error during chat processing: {e}")
+        # traceback.print_exc() # Optionally log the full traceback for connection errors too
+        response_text = "Error connecting to backend data stores. Please ensure services are running and configured."
+        return jsonify({"error": response_text}), 503  # Service Unavailable
     except Exception as e:
         print(f"!! Critical Error processing chat request: {e}")
-        response_text = "An unexpected error occurred while processing your request."
+        traceback.print_exc() # Log the full traceback for unexpected errors
+        response_text = "An unexpected error occurred while processing your request. Please check server logs."
         return jsonify({"error": "An internal server error occurred."}), 500
-    end_time = time.time(); processing_time = end_time - start_time
+    finally:
+        # Note: Database connections (g.db_conn) are typically closed by app.teardown_appcontext
+        # Langchain SQLDatabase and Chroma PersistentClient might not need explicit closing here
+        # if managed by 'g' or application context lifecycles.
+        pass
+
+    end_time = time.time()
+    processing_time = end_time - start_time
     print(f"Sending Response (Processing Time: {processing_time:.2f}s): '{response_text[:100]}...'")
     return jsonify({"reply": response_text})
 
@@ -61,19 +88,61 @@ def chat_handler():
 # Add a simple health check endpoint
 @rag_bp.route('/health', methods=['GET'])
 def health_check():
-    # (Same health_check logic as before)
-    # ... (omitted for brevity, assume function is pasted here) ...
-    db_ok = False; conn = None
+    """Checks the health of database connections and other essential services."""
+    print("\nPerforming health check...")
+    direct_sqlite_ok = False
+    langchain_sqlite_util_ok = False
+    chroma_ok = False
+    
+    # Check 1: Direct SQLite Connection
+    sqlite_conn = None
     try:
-        conn = utils.get_db()
-        if conn: conn.cursor().execute("SELECT 1"); db_ok = True
-    except Exception as e: print(f"Health check DB error: {e}")
-    chroma_ok = False; coll = None
-    try:
-        coll = utils.get_chroma_collection()
-        if coll: coll.count(); chroma_ok = True
-    except Exception as e: print(f"Health check Chroma error: {e}")
-    status = {"status": "OK" if db_ok and chroma_ok else "ERROR", "sqlite_status": "OK" if db_ok else "ERROR", "chromadb_status": "OK" if chroma_ok else "ERROR", "timestamp": time.time()}
-    status_code = 200 if status["status"] == "OK" else 503
-    return jsonify(status), status_code
+        sqlite_conn = utils.get_db_connection() # Corrected function name
+        if sqlite_conn:
+            sqlite_conn.cursor().execute("SELECT 1")
+            direct_sqlite_ok = True
+            print("  Direct SQLite connection: OK")
+        else:
+            print("  Direct SQLite connection: Failed to get connection object.")
+    except Exception as e:
+        print(f"  Health check - Direct SQLite DB error: {e}")
 
+    # Check 2: Langchain SQLDatabase Utility
+    try:
+        langchain_sql_db = utils.get_langchain_sql_db()
+        if langchain_sql_db:
+            # You could add a simple test like getting table names if needed
+            # print(f"  Langchain SQL DB tables: {langchain_sql_db.get_usable_table_names()}")
+            langchain_sqlite_util_ok = True
+            print("  Langchain SQLDatabase utility: OK")
+        else:
+            print("  Langchain SQLDatabase utility: Failed to initialize.")
+    except Exception as e:
+        print(f"  Health check - Langchain SQLDatabase utility error: {e}")
+
+    # Check 3: ChromaDB Connection
+    chroma_collection = None
+    try:
+        chroma_collection = utils.get_chroma_collection()
+        if chroma_collection:
+            chroma_collection.count() # A simple operation to check connectivity
+            chroma_ok = True
+            print("  ChromaDB connection: OK")
+        else:
+            print("  ChromaDB connection: Failed to get collection object.")
+    except Exception as e:
+        print(f"  Health check - ChromaDB error: {e}")
+
+    overall_status = "OK" if direct_sqlite_ok and langchain_sqlite_util_ok and chroma_ok else "ERROR"
+    
+    status_details = {
+        "status": overall_status,
+        "direct_sqlite_status": "OK" if direct_sqlite_ok else "ERROR",
+        "langchain_sqlite_utility_status": "OK" if langchain_sqlite_util_ok else "ERROR",
+        "chromadb_status": "OK" if chroma_ok else "ERROR",
+        "timestamp": time.time()
+    }
+    
+    status_code = 200 if overall_status == "OK" else 503 # Service Unavailable
+    print(f"Health check result: {overall_status}, Details: {status_details}")
+    return jsonify(status_details), status_code
