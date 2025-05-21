@@ -6,22 +6,25 @@ import sqlite3
 import google.generativeai as genai
 from flask import current_app, g # For app context and config
 import traceback # For more detailed error logging
+import json # For safely parsing potential list/dict string outputs
+import random # For varied greeting responses
 
 # Langchain imports
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains import create_sql_query_chain # To generate SQL
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain.memory import ConversationBufferMemory
-# from langchain.agents import AgentExecutor, create_tool_calling_agent # For a more general agent
-# from langchain_community.agent_toolkits import SQLDatabaseToolkit # For SQL agent
-# from langchain.tools import Tool # For custom tools if needed
+from langchain_core.messages import AIMessage, HumanMessage
+
+# --- SQL Agent Imports ---
+from langchain_community.agent_toolkits import SQLDatabaseToolkit, create_sql_agent
+from langchain.agents import AgentExecutor 
 
 # Import utils for DB access
 from . import utils
 
 # --- Global or App-Context based LLM and Memory (Example) ---
+# Initialize memory here, but it will be loaded/saved per session/request context
 global_memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
 
@@ -30,82 +33,127 @@ def get_llm():
     if 'llm' not in g:
         model_name = current_app.config.get('GENERATION_MODEL_NAME', 'gemini-1.5-pro-latest')
         try:
-            g.llm = ChatGoogleGenerativeAI(model=model_name, temperature=0.2, convert_system_message_to_human=True) # Lower temp for factual tasks
+            # Ensure convert_system_message_to_human is True if using older models or specific setups
+            g.llm = ChatGoogleGenerativeAI(model=model_name, temperature=0.2, convert_system_message_to_human=True) 
             print(f"LLM initialized with model: {model_name}")
         except Exception as e:
             print(f"Error initializing LLM: {e}")
+            traceback.print_exc()
             g.llm = None
     return g.llm
 
 def get_session_memory():
     """
-    Placeholder for session-specific memory.
-    Currently returns a global memory instance.
+    Retrieves the conversational memory for the current session.
+    In a real application, this might involve loading/saving session-specific memory.
+    For this example, it returns a global memory instance.
     """
     return global_memory
 
-
-# --- Langchain SQL Query Chain ---
-def create_db_query_chain(llm, db, k_for_prompt: int): # MODIFIED: Added k_for_prompt
-    """Creates a Langchain chain to generate and execute SQL queries."""
+# --- Langchain SQL Agent ---
+def create_sql_agent_executor(llm, db):
+    """Creates a Langchain SQL Agent Executor."""
     if not db:
-        print("Database not available for SQL query chain.")
+        print("Database not available for SQL agent.")
         return None
-    try:
-        sql_prompt_text = """Based on the table schema below, write a SQL query that would answer the user's question ({input}).
-You are requested to limit the number of results to {top_k} if you are selecting many rows or if the question implies a list.
-Only ask for the specific columns needed to answer the question. Do not select all columns unless explicitly asked.
-Pay attention to the user's question to extract entities like role names, project names, or application names.
-Only use the tables listed below. Do not hallucinate table or column names.
-Return ONLY the raw SQL query with no formatting, no markdown, no code blocks, and no extra text.
-
-Schema:
-{table_info}
-
-SQL Query:"""
-        
-        prompt = PromptTemplate(
-            input_variables=["input", "table_info", "top_k"], 
-            template=sql_prompt_text
-        )
-        
-        # MODIFIED: Pass k_for_prompt as the 'k' argument to create_sql_query_chain
-        # This 'k' argument will populate the {top_k} variable in your custom prompt.
-        generate_query_chain = create_sql_query_chain(llm, db, prompt=prompt, k=k_for_prompt)
-        return generate_query_chain
-    except Exception as e:
-        print(f"Error creating SQL query chain: {e}")
-        traceback.print_exc() # Print full traceback for debugging
+    if not llm:
+        print("LLM not available for SQL agent.")
         return None
-
-def clean_sql_query(query):
-    """
-    Clean SQL query by removing markdown code block syntax and any surrounding whitespace.
-    """
-    # Remove markdown code block syntax if present
-    query = re.sub(r'^```\s*sql\s*', '', query)
-    query = re.sub(r'```$', '', query)
-    # Clean any leading/trailing whitespace
-    query = query.strip()
-    return query
-
-def execute_sql_query(query, db):
-    """Executes a SQL query using the Langchain SQLDatabase tool and returns the result."""
-    # Clean the query before execution
-    cleaned_query = clean_sql_query(query)
-    print(f"   Original SQL: {query}")
-    print(f"   Cleaned SQL: {cleaned_query}")
+        
+    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+    top_k_val = current_app.config.get('LANGCHAIN_SQL_TOP_K', 5)
     
-    if not db:
-        return "Error: Database connection not available for SQL execution."
+    agent_executor = create_sql_agent(
+        llm=llm,
+        toolkit=toolkit,
+        verbose=current_app.config.get('LANGCHAIN_VERBOSE', True),
+        handle_parsing_errors="Check your output and try again. If you are using a tool, make sure the input is a valid SQL query. If you are providing a final answer, ensure it addresses the original question.",
+        top_k=top_k_val,
+    )
+    print(f"SQL Agent Executor created. Top_k for agent: {top_k_val}")
+    return agent_executor
+
+def is_result_empty_or_error(result_text: str) -> bool:
+    """
+    Checks if the agent's result text indicates no data found, an error, or is an empty list/dict.
+    """
+    if result_text is None:
+        return True
+    
+    text_lower = result_text.strip().lower()
+
+    no_result_phrases = [
+        "no results found", "i don't know", "i couldn't find any information",
+        "no data available", "the query returned no results", "no matching records",
+        "n/a (no query executed)", "n/a (agent decided sql not required or question unanswerable)",
+        "query executed successfully, no matching records found." 
+    ]
+    if any(phrase in text_lower for phrase in no_result_phrases):
+        return True
+
+    if text_lower == "[]" or text_lower == "{}" or text_lower == "none": 
+        return True
+    
     try:
-        result = db.run(cleaned_query) 
-        print(f"   SQL Result (first 100 chars): {str(result)[:100]}...")
-        return result
-    except Exception as e:
-        print(f"   Error executing SQL query '{cleaned_query}': {e}")
-        traceback.print_exc() # Print full traceback for debugging
-        return f"Error executing SQL: {e}"
+        if text_lower.startswith('[') and text_lower.endswith(']') or \
+           text_lower.startswith('{') and text_lower.endswith('}'):
+            parsed_json = json.loads(result_text) 
+            if isinstance(parsed_json, (list, dict)) and not parsed_json:
+                return True
+    except json.JSONDecodeError:
+        pass 
+
+    error_indicators = ["error executing sql", "sql agent error", "failed to execute", "an error occurred"]
+    if any(indicator in text_lower for indicator in error_indicators):
+        return True
+        
+    return False
+
+
+def parse_agent_output(agent_response_text: str):
+    """
+    Parses the agent's output text to extract the SQL query and the actual result.
+    Relies on the agent being prompted to return "SQL Query: ..." and "Result: ...".
+    """
+    generated_sql = "N/A (Agent did not explicitly state SQL)"
+    query_result = agent_response_text 
+
+    match = re.search(r"SQL Query:\s*(.*?)(?:\n(?:Result:|Answer:)\s*(.*)|$)", agent_response_text, re.DOTALL | re.IGNORECASE)
+
+    if match:
+        generated_sql = match.group(1).strip() if match.group(1) else "N/A (SQL query part was empty)"
+        query_result = match.group(2).strip() if match.group(2) else "N/A (Result/Answer part was empty after SQL Query marker)"
+        
+        if query_result == "N/A (Result/Answer part was empty after SQL Query marker)" and generated_sql != "N/A (SQL query part was empty)":
+             if "i don't need to query" in agent_response_text.lower() or \
+               "no sql query is needed" in agent_response_text.lower() or \
+               "n/a (no query executed)" in generated_sql.lower():
+                generated_sql = "N/A (Agent decided SQL not required)"
+                query_result = agent_response_text 
+    else:
+        if "i don't need to query" in agent_response_text.lower() or \
+           "no sql query is needed" in agent_response_text.lower() or \
+           ("i don't know" in agent_response_text.lower() and "select" not in agent_response_text.lower()): 
+            generated_sql = "N/A (Agent decided SQL not required or question unanswerable)"
+            query_result = agent_response_text 
+        else:
+            query_result = agent_response_text
+            generated_sql = "N/A (No SQL Query marker found, or format mismatch)"
+
+    if query_result == agent_response_text and "N/A" not in generated_sql:
+        if generated_sql in agent_response_text:
+            potential_result_start = agent_response_text.find(generated_sql) + len(generated_sql)
+            query_result_candidate = agent_response_text[potential_result_start:].strip()
+            if query_result_candidate: 
+                 query_result = query_result_candidate
+
+    if not query_result.strip() and "N/A (Agent decided SQL not required" not in generated_sql:
+        query_result = "Agent provided SQL but the result part was empty or not found."
+        
+    if "N/A" not in generated_sql and query_result.lower().strip() in ["", "[]", "{}","none"]:
+        query_result = "Query executed, but no specific data returned or result was empty."
+
+    return generated_sql, query_result
 
 
 # --- Vector Retrieval (ChromaDB) ---
@@ -115,7 +163,6 @@ def retrieve_vector_data(query, collection):
     context_lines = []
     api_key = current_app.config.get('GOOGLE_API_KEY')
     embedding_model_name = current_app.config.get('EMBEDDING_MODEL_NAME')
-    # Use CHROMA_QUERY_N_RESULTS for querying, CHROMA_N_RESULTS might be for init or other uses
     n_results = current_app.config.get('CHROMA_QUERY_N_RESULTS', 5) 
 
     if not api_key: print("      Skipping ChromaDB retrieval: API key missing."); return context_lines
@@ -129,139 +176,257 @@ def retrieve_vector_data(query, collection):
         print(f"      Query embedded. Searching collection for {n_results} results...")
         results = collection.query(query_embeddings=[query_embedding], n_results=n_results, include=['documents', 'metadatas'])
         
-        if results and results.get('ids') and results['ids'][0]:
-            print(f"      Found {len(results['ids'][0])} potentially relevant documents.")
-            context_lines.append("Potentially Relevant Entitlement Descriptions from Vector Search:")
+        if results and results.get('ids') and results['ids'][0]: 
+            print(f"      Found {len(results['ids'][0])} potentially relevant documents from Chroma.")
+            context_lines.append("Potentially Relevant Entitlement Descriptions from Semantic Search:")
             for i in range(len(results['ids'][0])):
-                meta = results['metadatas'][0][i]; doc = results['documents'][0][i]
+                meta = results['metadatas'][0][i] if results['metadatas'] and results['metadatas'][0] else {}
+                doc = results['documents'][0][i] if results['documents'] and results['documents'][0] else "N/A"
                 context_lines.append(f"- Code {meta.get('code', 'N/A')} (ID: {meta.get('id', 'N/A')}): {doc}")
-        else: print("      No relevant documents found in ChromaDB.")
+        else: 
+            print("      No relevant documents found in ChromaDB for the query.")
     except Exception as e: 
         print(f"      Error during ChromaDB retrieval/embedding: {e}")
         traceback.print_exc()
     return context_lines
 
+
+def extract_mentioned_application_from_history(chat_history_messages, current_query):
+    """
+    Extracts the most recently mentioned application name from chat history,
+    giving preference to applications mentioned in relation to entitlements.
+    Returns the application name or None.
+    """
+    app_keywords = ["application", "portal", "system", "platform", "app ", " service", " hub"] 
+    query_context_keywords = ["entitlement", "access", "permission", "manager", "role", "what is required for"]
+
+    for message in reversed(chat_history_messages):
+        text_to_search = ""
+        if isinstance(message, HumanMessage):
+            text_to_search = message.content.lower()
+        elif isinstance(message, AIMessage):
+            text_to_search = message.content.lower()
+        
+        if any(kw in text_to_search for kw in app_keywords):
+            for kw in app_keywords:
+                if kw in text_to_search:
+                    if "branch customer portal" in text_to_search:
+                        return "Branch Customer Portal"
+            
+            potential_apps = re.findall(r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*(?:application|portal|system|platform|service|hub)", text_to_search, re.IGNORECASE)
+            if potential_apps:
+                if any(q_kw in current_query.lower() for q_kw in query_context_keywords):
+                    return potential_apps[0] 
+
+    return None
+
+
 # --- Main RAG Chain with Conversational Memory ---
 def get_conversational_rag_answer(user_query, db_connection_for_sql_tool, chroma_collection_for_vector):
     """
     Processes the user query using a RAG pipeline with conversational memory
-    and LLM-powered SQL generation.
+    and an LLM-powered SQL Agent. Handles greetings and no-result scenarios gracefully.
     """
-    print("--- Executing Conversational RAG Pipeline ---")
-    llm = get_llm()
-    if not llm:
-        return "Error: LLM not available."
-
-    langchain_db = db_connection_for_sql_tool 
-
-    sql_query_result = "No SQL query was executed or needed for this query." # Default message
-    generated_sql = "N/A"
+    print(f"\n--- Executing Conversational RAG Pipeline for Query: '{user_query}' ---")
     
-    if langchain_db:
-        # MODIFIED: Get top_k_val for the k_for_prompt argument
-        top_k_val = current_app.config.get('LANGCHAIN_SQL_TOP_K', 5) 
-        db_query_chain = create_db_query_chain(llm, langchain_db, k_for_prompt=top_k_val)
-        
-        if db_query_chain:
-            try:
-                print("   Attempting to generate SQL query...")
-                # MODIFIED: Invoke with "question" key
-                generated_sql = db_query_chain.invoke({"question": user_query})
-                
-                # Improved check for valid SQL or LLM's decision not to query
-                if "error" in generated_sql.lower() or \
-                   not generated_sql.strip() or \
-                   "select" not in generated_sql.lower() or \
-                   len(generated_sql.strip()) < 10 or \
-                   "i don't need to query" in generated_sql.lower() or \
-                   "no sql query is needed" in generated_sql.lower():
-                    
-                    print(f"   LLM indicated an issue generating SQL or SQL not needed: {generated_sql}")
-                    if "i don't need to query" in generated_sql.lower() or \
-                       "no sql query is needed" in generated_sql.lower() or \
-                       ("select" not in generated_sql.lower() and len(generated_sql.strip()) > 5) : # If it's a short non-SQL phrase
-                        sql_query_result = "The Language Model determined that a SQL query was not necessary for this question."
-                        generated_sql = "N/A (LLM decided SQL not required)"
-                    else:
-                        sql_query_result = f"Could not generate a suitable SQL query. LLM Output: {generated_sql}"
-                        generated_sql = f"N/A (LLM failed to generate valid SQL: {generated_sql})"
-                else:
-                    # Store the original generated SQL before cleaning for display purposes
-                    original_sql = generated_sql
-                    sql_query_result = execute_sql_query(generated_sql, langchain_db)
-                    # Keep the original SQL for display in final context
-                    generated_sql = original_sql
-            except KeyError as ke: # Specifically catch KeyError
-                print(f"   KeyError during SQL generation/execution: {ke}")
-                print("     This might indicate an issue with expected keys in Langchain's create_sql_query_chain or its inputs.")
-                traceback.print_exc()
-                sql_query_result = f"Error during SQL processing (KeyError: {ke}). Please check prompt and chain input configurations."
-                generated_sql = "Error during generation (KeyError)"
-            except Exception as e:
-                print(f"   Error in SQL generation/execution part of the chain: {e}")
-                traceback.print_exc()
-                sql_query_result = f"Error during SQL processing: {e}"
-                generated_sql = "Error during generation"
-        else:
-            sql_query_result = "SQL query chain could not be created (returned None)."
-    else:
-        sql_query_result = "Database for SQL queries is not configured or available."
+    memory = get_session_memory()
+    chat_history_messages = memory.load_memory_variables({}).get("chat_history", [])
+    llm = get_llm() # Get LLM instance early
 
+    if not llm:
+        return "Error: LLM not available. Please check configuration."
+
+    # 1. Enhanced Greeting/Introductory Query Check
+    query_lower_stripped = user_query.lower().strip()
+    query_for_check = re.sub(r'[^\w\s]', '', query_lower_stripped) 
+
+    greetings = ["hello", "hi", "hey", "greetings", "good morning", "good afternoon", "good evening", "howdy"]
+    # help_phrases = ["can you help", "i need help", "help me"] # Not used in the if condition below directly
+    entitlement_keywords = [
+        "entitlement", "access", "permission", "permit", "role", "project", 
+        "application", "app", "system", "platform", "software", "tool", 
+        "db", "database", "data", "report", "feature", "module", "functionality",
+        "what are", "what is", "who has", "do i have", "can i get", "how to get", "list all",
+        "manager", "required for" 
+    ]
+
+    is_simple_greeting_type = any(g in query_for_check for g in greetings)
+    has_specific_entitlement_context = any(kw in query_for_check for kw in entitlement_keywords)
+    
+    name_match = re.search(r"\b(?:i'm|i am|im|my name is)\s+(\w+)", query_lower_stripped, re.IGNORECASE)
+    user_name = name_match.group(1).capitalize() if name_match else None
+
+    if is_simple_greeting_type and not has_specific_entitlement_context and len(query_for_check.split()) < 8:
+        print("   Query identified as a simple greeting. Using LLM for response.")
+        
+        greeting_system_prompt = (
+            "You are a friendly and helpful Entitlement Assistant chatbot. "
+            "The user has just greeted you."
+        )
+        if user_name:
+            greeting_system_prompt += f" The user's name is {user_name}."
+        
+        greeting_human_template = (
+            "{user_greeting}\n\n"
+            "Please provide a concise, welcoming response. Acknowledge the user's greeting (and name, if provided). "
+            "Then, briefly offer to help with application entitlements."
+        )
+
+        greeting_prompt = ChatPromptTemplate.from_messages([
+            ("system", greeting_system_prompt),
+            ("human", greeting_human_template)
+        ])
+        
+        greeting_chain = greeting_prompt | llm | StrOutputParser()
+        
+        try:
+            response_text = greeting_chain.invoke({"user_greeting": user_query})
+        except Exception as e:
+            print(f"   Error during LLM greeting generation: {e}")
+            traceback.print_exc()
+            # Fallback to a simpler hardcoded greeting if LLM fails for this specific path
+            base_greeting = "Hello"
+            if user_name: base_greeting = f"Hello {user_name}!"
+            offer_help = "How can I help you with application entitlements today?"
+            response_text = f"{base_greeting} {offer_help}"
+
+        memory.save_context({"input": user_query}, {"output": response_text})
+        print(f"   Responding with LLM-generated greeting: {response_text}")
+        return response_text
+
+    # --- If not a simple greeting, proceed with the full RAG pipeline ---
+    langchain_db_for_agent = db_connection_for_sql_tool 
+    sql_agent_executor = None
+    sql_agent_raw_output = "SQL Agent was not invoked." 
+    generated_sql_for_context = "N/A"
+    sql_result_for_context = "No information was retrieved from the database for this query." 
+
+    recent_app_context = extract_mentioned_application_from_history(chat_history_messages, user_query)
+    app_context_for_prompt = f"A relevant application from recent conversation history might be: '{recent_app_context}'. Prioritize this if the current query is a follow-up." if recent_app_context else "No specific application context from prior conversation turns was identified as immediately relevant for this query."
+
+    if langchain_db_for_agent:
+        sql_agent_executor = create_sql_agent_executor(llm, langchain_db_for_agent)
+        if sql_agent_executor:
+            try:
+                print("   Attempting to get answer from SQL Agent...")
+                agent_input_prompt_template = (
+                    "User question: {user_query}\n\n"
+                    "Consider the ongoing conversation. {app_context_for_prompt}\n\n"
+                    "Based on the table schema, if a SQL query is needed, write and execute it. "
+                    "Limit the number of results to {top_k} if selecting many rows or if the question implies a list. "
+                    "Only ask for the specific columns needed to answer the question. "
+                    "Pay close attention to entities like role names, project names, or application names in the user's question and history. "
+                    "If an exact match for an entity is not found, consider using SQL `LIKE` clauses for partial matches or to find the closest matching entity name first, then use that identified name in your main query. "
+                    "For example, if the user asks about 'Branch Portal' and the database has 'Branch Customer Portal', try to identify 'Branch Customer Portal' as the target application, especially if it was mentioned in recent conversation. "
+                    "Do not hallucinate table or column names. Only use the tables you know about: {table_names}. "
+                    "The most important tables for entitlements are 'Entitlements', 'Applications', 'AppEntitlementMappings', 'Roles'. "
+                    "To find what entitlements are needed for a role in an application, you might need to join Applications with AppEntitlementMappings and then Entitlements, and filter by application name and potentially role descriptions or typical role functions (e.g., 'MANAGE' for managers). "
+                    "PRIVACY INSTRUCTION: Your primary goal is to identify entitlements, not individuals. "
+                    "Do NOT retrieve or list individual employee names, email addresses, or specific employee-to-entitlement/project assignments in your 'Result:'. "
+                    "If the user asks about requirements for a role (e.g., 'manager') for an application, describe the *types* of entitlements or list the relevant entitlement codes and their descriptions (e.g., 'APP001_MANAGE: Allows management of resources'). "
+                    "Do NOT mention who currently holds these entitlements or list the names of managers. Focus on the *what* (entitlements, applications, roles), not the *who*. "
+                    "For example, if asked 'what is required for managers in Branch Portal?', a good response would list entitlements like 'APP001_MANAGE', not 'Gregory Flynn has APP001_MANAGE'.\n\n"
+                    "IMPORTANT: After you have the result from the database (or if you decide no query is needed, or if an error occurs), "
+                    "format your entire response as follows, making sure to include both parts clearly separated:\n"
+                    "SQL Query: [The SQL query you attempted or used. If no query was used, state 'N/A (No query executed)'. If there was an error before execution, state the intended query and the error if possible.]\n"
+                    "Result: [The result from the database, your textual answer if no query was executed, or a description of the error if one occurred. If the query ran but returned no data, explicitly state that, e.g., 'Query executed successfully, no matching records found.']"
+                )
+                
+                agent_input = agent_input_prompt_template.format(
+                    user_query=user_query,
+                    app_context_for_prompt=app_context_for_prompt,
+                    top_k=current_app.config.get('LANGCHAIN_SQL_TOP_K', 5),
+                    table_names=langchain_db_for_agent.get_usable_table_names()
+                )
+
+                agent_response = sql_agent_executor.invoke({"input": agent_input})
+                sql_agent_raw_output = agent_response.get('output', "SQL Agent did not return a standard output key.")
+                print(f"   SQL Agent Raw Output: {sql_agent_raw_output}")
+
+                parsed_sql, parsed_result = parse_agent_output(sql_agent_raw_output)
+                generated_sql_for_context = parsed_sql
+                
+                print(f"   Parsed SQL from Agent: {generated_sql_for_context}")
+                print(f"   Parsed Result from Agent (raw): {parsed_result[:300]}...") 
+
+                if is_result_empty_or_error(parsed_result):
+                    print(f"   SQL Agent result indicates no data or an error. Parsed result: '{parsed_result}'")
+                    sql_result_for_context = parsed_result if parsed_result else "The database query did not return specific information for this request."
+                else:
+                    sql_result_for_context = parsed_result 
+                    print(f"   SQL Agent provided data: {sql_result_for_context[:300]}...")
+
+            except Exception as e:
+                print(f"   Error invoking SQL Agent or parsing its output: {e}")
+                traceback.print_exc()
+                sql_result_for_context = f"An error occurred while trying to get information from the database. (Details: {str(e)[:100]})" 
+                generated_sql_for_context = "Error during agent execution"
+                sql_agent_raw_output = f"Exception during agent invocation: {e}"
+        else:
+            sql_result_for_context = "SQL Agent Executor could not be created. Database query not attempted."
+            sql_agent_raw_output = "SQL Agent Executor was None."
+    else:
+        sql_result_for_context = "Database for SQL Agent is not configured or available. Query not attempted."
+        sql_agent_raw_output = "Langchain DB for Agent was None."
+
+    print(f"   DEBUG SQL Agent Interaction Summary:\n   User Query to Agent: {user_query}\n   Generated SQL (stated by agent): {generated_sql_for_context}\n   Raw Agent Output (first 300 chars): {sql_agent_raw_output[:300]}...\n   Interpreted Agent Result for Final Context (first 300 chars): {str(sql_result_for_context)[:300]}...")
 
     vector_context_lines = retrieve_vector_data(user_query, chroma_collection_for_vector)
-    vector_context_str = "\n".join(vector_context_lines) if vector_context_lines else "No additional relevant information found via semantic search of entitlement descriptions."
+    vector_context_str = "\n".join(vector_context_lines) if vector_context_lines else "No additional information was found through semantic search of entitlement descriptions."
 
-    memory = get_session_memory()
-    # Ensure chat_history is correctly loaded; it might be empty on first turn
-    chat_history_messages = memory.load_memory_variables({}).get("chat_history", [])
-
-
-    final_context = f"""
+    final_context_for_llm = f"""
     User Query: {user_query}
 
-    Information from Database (via SQL query, if attempted):
-    Generated SQL: {generated_sql}
-    SQL Query Result:
-    {sql_query_result}
+    Information from Database (via SQL Agent):
+    Agent's Stated SQL: {generated_sql_for_context}
+    Agent's Result/Answer (interpreted):
+    {sql_result_for_context}
 
     Additional Information from Semantic Search (Vector DB of entitlement descriptions):
     {vector_context_str}
     """
-
-    # Refined system prompt for better instruction
+    
     system_prompt_text = (
         "You are a specialized Entitlement Assistant. Your primary goal is to answer the user's questions about application entitlements "
-        "based *solely* on the information provided in the 'Context' section below. The context includes results from database queries and semantic searches. "
+        "based *solely* on the information provided in the 'Context' section below. The context includes an interpretation of results from a SQL Agent (which queries a database) and semantic searches of entitlement descriptions. "
         "Carefully review all parts of the context. "
-        "If the 'SQL Query Result' indicates an error, no data, or that a query wasn't needed, state that clearly. "
-        "If 'Additional Information from Semantic Search' is empty or states no relevant documents were found, acknowledge that. "
-        "Synthesize a comprehensive answer from all available pieces of information. "
-        "If the combined context is insufficient to fully answer the question, clearly state what information is missing or unclear. "
+        "The 'Agent's Stated SQL' shows the query the SQL Agent claims to have attempted or used. The 'Agent's Result/Answer (interpreted)' is what the SQL Agent found, or a summary if no specific data was returned or an error occurred. "
+        "PRIVACY GUIDELINE: Absolutely do not reveal any personally identifiable information (PII) such as employee names, lists of employees, specific individuals associated with roles or applications, or employee emails, even if such data might accidentally appear in the 'Context' from the SQL agent. "
+        "Your role is to provide information about entitlements, roles, and applications in a general, non-identifying way. "
+        "If the context accidentally contains PII (like specific employee names when asked about general role requirements), you MUST ignore that PII for the purpose of your answer regarding individuals. Focus on the *what* (entitlements, applications, roles) and not the *who*. "
+        "For instance, if asked about manager requirements for 'Branch Portal' and the context mentions 'Gregory Flynn has APP001_MANAGE', your answer should be about 'APP001_MANAGE' and its function for managers, NOT about Gregory Flynn. "
+        "If the 'Agent's Result/Answer (interpreted)' indicates that no specific information was retrieved or an error happened, acknowledge this politely. For example, you might say 'I couldn't find specific details for that in our records' or 'I was unable to retrieve that specific information at the moment.' Do not say 'the database returned no results' or 'there was an error.' "
+        "Similarly, if 'Additional Information from Semantic Search' indicates no relevant documents were found, integrate that smoothly. "
+        "Synthesize a comprehensive and helpful answer from all available pieces of information in the context. "
+        "If the combined context is insufficient to fully answer the question, clearly state that the information isn't available in the current knowledge base or ask clarifying questions that might help narrow down the search. "
         "Do not make up information or answer outside of the provided context. "
-        "If a specific entitlement code is identified (e.g., APP001_READ), mention it. "
-        "Maintain a helpful and professional tone."
+        "If a specific entitlement code is identified (e.g., APP001_READ), mention it and its description if available. "
+        "Maintain a helpful, conversational, and professional tone. Use the chat history for conversational flow and to understand follow-up questions. Avoid technical jargon where possible."
     )
 
-    final_answer_prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt_text),
-        MessagesPlaceholder(variable_name="chat_history"), # Ensure this is correctly populated
-        ("human", "Context:\n{context}\n\nUser's Question: {question}\n\nAssistant's Answer:"),
-    ])
+    prompt_messages = [
+        SystemMessagePromptTemplate.from_template(system_prompt_text),
+        MessagesPlaceholder(variable_name="chat_history"), 
+        HumanMessagePromptTemplate.from_template("Context:\n{context}\n\nUser's Question: {question}\n\nAssistant's Answer:")
+    ]
+    final_answer_prompt = ChatPromptTemplate.from_messages(prompt_messages)
 
     final_chain = final_answer_prompt | llm | StrOutputParser()
 
     print("   Generating final response with aggregated context and history...")
+
+    response_text = "Sorry, I encountered an issue while processing your request. Please try again." 
     try:
         response_text = final_chain.invoke({
-            "context": final_context,
+            "context": final_context_for_llm,
             "question": user_query,
-            "chat_history": chat_history_messages # Pass the actual messages
+            "chat_history": chat_history_messages 
         })
     except Exception as e:
         print(f"   Error during final LLM response generation: {e}")
         traceback.print_exc()
-        response_text = "Sorry, an error occurred while formulating the final answer. Please check the server logs for more details."
+        response_text = "Sorry, an error occurred while formulating the final answer. Please check the server logs for more details or try rephrasing your question."
 
-    memory.save_context({"input": user_query}, {"output": response_text})
-
+    memory.save_context({"input": user_query}, {"output": response_text}) 
+    print(f"--- RAG Pipeline Finished. Final Response (first 300 chars): {response_text[:300]}... ---")
     return response_text
